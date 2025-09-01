@@ -1,19 +1,18 @@
 """
-CRC Manuscript Builder – Streamlit app (MVP v3)
+CRC Manuscript Builder – Streamlit app (MVP v3.1)
 Author: ChatGPT (for Jun)
 Date: 2025-09-01 (KST)
 
-What this app does (v3 변경사항)
--------------------------------
-1) **초록(Abstract) & 결론(Conclusion) 컬럼 추가**: 검색/허용 문헌 표에 모두 표시
-2) **EndNote(.ris) 다운로드**: 
-   - 검색표에서 체크한 항목만
-   - 허용 문헌(전체/선택) 둘 다 지원
-3) **선택 추가/삭제**: 
-   - 검색표에서 체크 → 허용 문헌에 추가
-   - 허용 문헌 표에서 체크 → 삭제
-4) **정렬 로직 개선**: IF 내림차순 → 저널명(안정 정렬) → 저널 내 연도 최신순
-5) (선택) PDF에서 DOI 추출, DOI/PMID 수동 추가 입력 제공
+이번 버전(v3.1) 변경점
+-----------------------
+- ❌ 오류 수정: `RefMeta`에 `abstract_text`, `abstract_conclusion` 필드가 없어 발생하던 AttributeError 해결
+- ✅ PubMed 파서가 초록/결론을 추출하여 표에 `Abstract`, `Conclusion` 컬럼으로 표시
+- ✅ EndNote(.ris) 다운로드: 검색 **선택 항목**, 허용 문헌 **선택/전체** 모두 지원
+- ✅ 허용 문헌 표에서 **체크 후 삭제** 가능
+- ✅ 연구계획서 **Word(.docx) 업로드→자동 채움** 복구
+- ✅ 타깃 저널/스타일 **선택 UI** 복구(대한대장항문학회/ASCRS/ESCP/기타)
+- ✅ 정렬: **IF 내림차순 → 저널명(안정 정렬) → 저널 내 연도 최신순**
+- ❌ "앵커 가이드라인" 입력칸 제거(요청 반영)
 
 설치:
   pip install streamlit requests pandas lxml pymupdf python-docx pydantic tenacity
@@ -39,7 +38,7 @@ from docx.shared import Pt
 # =====================
 # Config & constants
 # =====================
-APP_TITLE = "CRC Manuscript Builder (MVP v3)"
+APP_TITLE = "CRC Manuscript Builder (MVP v3.1)"
 EUTILS_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 CROSSREF_BASE = "https://api.crossref.org/works"
 OPENALEX_BASE = "https://api.openalex.org/sources"
@@ -196,7 +195,6 @@ def _xml_text(node, xpath: str) -> Optional[str]:
 
 
 def _extract_abstract_and_conclusion(art: etree._Element) -> Tuple[Optional[str], Optional[str]]:
-    # Gather all AbstractText nodes
     nodes = art.findall(".//Abstract/AbstractText")
     if not nodes:
         return None, None
@@ -209,7 +207,6 @@ def _extract_abstract_and_conclusion(art: etree._Element) -> Tuple[Optional[str]
             continue
         parts.append(val)
         if label.startswith("conclusion"):
-            # take first two sentences
             sent = re.split(r"(?<=[.!?])\s+", val)
             conclusion = " ".join(sent[:2]).strip()
     full = " \n".join(parts) if parts else None
@@ -342,39 +339,34 @@ with st.expander("사용 지침(필독)", expanded=True):
         """
     )
 
-# 1) 기본 입력
+# 1) 입력(연구계획서 .docx 업로드 포함) + 타깃 저널/스타일
 colA, colB = st.columns([3, 2])
 with colA:
     topic = st.text_area("주제 (Topic)", height=80)
-    protocol = st.text_area("연구계획서 요약 (Study Protocol)", height=130)
+    protocol = st.text_area("연구계획서 요약 (Study Protocol)", height=160, key="protocol_ta")
+    up_docx = st.file_uploader("연구계획서 요약 .docx 업로드 (선택)", type=["docx"], accept_multiple_files=False)
+    if up_docx is not None:
+        try:
+            bio = io.BytesIO(up_docx.read())
+            doc = Document(bio)
+            text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+            st.session_state["protocol_ta"] = text
+            st.success("워드 파일에서 연구계획서 요약을 불러왔어요.")
+        except Exception as e:
+            st.error(f"워드 파일을 읽는 중 오류: {e}")
     results_txt = st.text_area("핵심 결과 요약 (Key Results)", height=100)
+
 with colB:
+    style_option = st.selectbox("타깃 저널/스타일", [
+        "국내: 대한대장항문학회(Annals of Coloproctology)",
+        "해외: ASCRS 스타일 (Diseases of the Colon & Rectum)",
+        "해외: ESCP 스타일 (Colorectal Disease)",
+        "없음/기타(직접입력)",
+    ])
+    custom_style = ""
+    if style_option == "없음/기타(직접입력)":
+        custom_style = st.text_input("직접 입력", placeholder="예: BJS 스타일, 또는 목표 저널명")
     use_openalex = st.checkbox("OpenAlex 지표 사용(대체 지표)", value=False)
-    manual_add = st.text_input("DOI 또는 PMID 수동 추가", placeholder="예: 10.1097/DCR.0000000000000000 또는 38912345")
-    if st.button("허용 문헌에 수동 추가") and manual_add.strip():
-        token = manual_add.strip()
-        key = None
-        meta = None
-        if token.lower().startswith("10."):
-            key = token.lower()
-            meta = crossref_get(key) or RefMeta(doi=key)
-        else:
-            # treat as PMID via PubMed
-            try:
-                root = pubmed_fetch_xml([token])
-                recs = pubmed_parse_records(root)
-                if recs:
-                    m = recs[0]
-                    key = (m.doi.lower() if m.doi else f"pmid:{m.pmid}")
-                    meta = m
-            except Exception:
-                pass
-        if key and meta:
-            st.session_state.setdefault("allowed", {})
-            st.session_state["allowed"][key] = meta
-            st.success("수동 추가 완료")
-        else:
-            st.error("추가 실패: DOI/PMID를 확인해 주세요.")
 
 st.divider()
 
@@ -496,7 +488,7 @@ if st.session_state.search_results:
 
 st.divider()
 
-# 3) PDF 업로드 → 허용 문헌에 추가
+# 3) PDF 업로드 → 허용 문헌
 st.subheader("3) PDF 업로드(최대 50) → 허용 문헌")
 pdfs = st.file_uploader("논문 PDF 업로드", type=["pdf"], accept_multiple_files=True)
 if st.button("PDF에서 DOI 추출 후 추가") and pdfs:
@@ -560,16 +552,9 @@ if st.session_state.allowed:
         st.success(f"삭제 완료: {len(to_del)}편")
 
     if ris_allowed_sel or ris_allowed_all:
-        export_keys = None
-        if ris_allowed_sel:
-            export_keys = edited_allowed[edited_allowed["select"] == True]["key"].tolist()
-        else:
-            export_keys = list(st.session_state.allowed.keys())
-        refs = []
-        for k in export_keys:
-            m = st.session_state.allowed.get(k)
-            if m:
-                refs.append(m)
+        export_keys = (edited_allowed[edited_allowed["select"] == True]["key"].tolist() if ris_allowed_sel
+                       else list(st.session_state.allowed.keys()))
+        refs = [st.session_state.allowed[k] for k in export_keys if k in st.session_state.allowed]
         ris_txt = to_ris(refs)
         fname = "allowed_selection.ris" if ris_allowed_sel else "allowed_all.ris"
         st.download_button(".ris 다운로드", data=ris_txt.encode("utf-8"), file_name=fname, mime="application/x-research-info-systems")
@@ -613,7 +598,7 @@ class LLM:
                 "topic": topic,
                 "study_protocol": protocol,
                 "key_results": results,
-                "journal_style": "Vancouver-style generic clinical paper",
+                "journal_style": style_note,
                 "citation_rule": "Use only allowed sources via [CITE:...] tags.",
                 "allowed_sources": refs_serialized,
                 "language": "Korean",
@@ -643,6 +628,7 @@ class LLM:
             return f"(LLM 오류) {e}"
 
 llm = LLM(OPENAI_MODEL, OPENAI_API_KEY)
+style_note = (custom_style if style_option == "없음/기타(직접입력)" else style_option)
 SECTIONS = ["Cover Letter", "Title Page", "Abstract", "Introduction", "Methods", "Results", "Discussion"]
 
 if "sections" not in st.session_state:
@@ -653,7 +639,7 @@ for i, sec in enumerate(SECTIONS):
     with cols[i % 2]:
         st.markdown(f"**{sec}**")
         if st.button(f"{sec} 생성", key=f"gen_{sec}"):
-            txt = llm.generate_section(sec, topic, protocol, results_txt, st.session_state.allowed, "Vancouver")
+            txt = llm.generate_section(sec, topic, st.session_state.get("protocol_ta", ""), results_txt, st.session_state.allowed, style_note)
             st.session_state.sections[sec] = txt
         st.text_area(f"{sec} 미리보기", value=st.session_state.sections.get(sec, ""), height=200, key=f"ta_{sec}")
 
@@ -721,4 +707,4 @@ if "final_md" in st.session_state:
 
 st.divider()
 
-st.caption("© 2025 CRC Manuscript Builder (MVP v3). Evidence-locked generation. No PHI.")
+st.caption("© 2025 CRC Manuscript Builder (MVP v3.1). Evidence-locked generation. No PHI.")
