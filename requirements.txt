@@ -1,0 +1,8 @@
+streamlit==1.36.0
+requests
+pandas
+lxml
+pymupdf
+python-docx
+pydantic
+tenacity
