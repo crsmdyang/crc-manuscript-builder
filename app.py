@@ -1,21 +1,21 @@
 """
-CRC Manuscript Builder – Streamlit app (MVP v3.1)
+CRC Manuscript Builder – Streamlit app (MVP v3.1.4)
 Author: ChatGPT (for Jun)
 Date: 2025-09-01 (KST)
 
-이번 버전(v3.1) 변경점
------------------------
-- ❌ 오류 수정: `RefMeta`에 `abstract_text`, `abstract_conclusion` 필드가 없어 발생하던 AttributeError 해결
-- ✅ PubMed 파서가 초록/결론을 추출하여 표에 `Abstract`, `Conclusion` 컬럼으로 표시
-- ✅ EndNote(.ris) 다운로드: 검색 **선택 항목**, 허용 문헌 **선택/전체** 모두 지원
-- ✅ 허용 문헌 표에서 **체크 후 삭제** 가능
-- ✅ 연구계획서 **Word(.docx) 업로드→자동 채움** 복구
-- ✅ 타깃 저널/스타일 **선택 UI** 복구(대한대장항문학회/ASCRS/ESCP/기타)
-- ✅ 정렬: **IF 내림차순 → 저널명(안정 정렬) → 저널 내 연도 최신순**
-- ❌ "앵커 가이드라인" 입력칸 제거(요청 반영)
+이번 버전(v3.1.4) 변경점
+-------------------------
+- ❌ **ModuleNotFoundError: 'docx' (python-docx)** 환경에서도 동작하도록 **.docx 읽기/쓰기 대체 경로** 추가
+  - 읽기: `python-docx`가 없으면 ZIP으로 `.docx`를 열어 `word/document.xml`을 직접 파싱
+  - 쓰기: `python-docx`가 없으면 **최소 DOCX**를 ZIP으로 생성(문단별 텍스트)
+- ✅ v3.1.3의 **Streamlit Shim**(UI 미설치 환경)과 **PDF 백엔드 조건부 임포트** 유지
+- 🧪 테스트 보강: DOCX fallback 생성/파싱 라운드트립 테스트 추가
 
-설치:
-  pip install streamlit requests pandas lxml pymupdf python-docx pydantic tenacity
+설치(권장)
+----------
+- UI 사용(권장): `pip install streamlit requests pandas lxml pydantic tenacity python-docx pymupdf`
+- 경량: `pip install streamlit requests pandas lxml pydantic tenacity pypdf`
+
 실행:
   streamlit run app.py
 """
@@ -24,21 +24,121 @@ import os
 import io
 import re
 import json
-import fitz  # PyMuPDF
+import zipfile
 import requests
-import streamlit as st
 import pandas as pd
+import xml.etree.ElementTree as ET
 from typing import List, Dict, Optional, Tuple
 from lxml import etree
 from tenacity import retry, stop_after_attempt, wait_exponential
 from pydantic import BaseModel, Field
-from docx import Document
-from docx.shared import Pt
+
+# =====================
+# Optional python-docx (with fallback)
+# =====================
+try:
+    from docx import Document  # type: ignore
+    from docx.shared import Pt  # type: ignore
+    _HAVE_PYDOCX = True
+except Exception:
+    Document = None  # type: ignore
+    Pt = None  # type: ignore
+    _HAVE_PYDOCX = False
+
+# =====================
+# Streamlit import (with headless shim fallback)
+# =====================
+try:
+    import streamlit as st  # type: ignore
+    _HAVE_STREAMLIT = True
+except Exception:
+    _HAVE_STREAMLIT = False
+    # ---- Streamlit Shim ----
+    class _NoopContext:
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            return False
+    class _SidebarShim:
+        def success(self, *a, **k): print("[sidebar.success]", *a)
+        def error(self, *a, **k): print("[sidebar.error]", *a)
+        def warning(self, *a, **k): print("[sidebar.warning]", *a)
+        def info(self, *a, **k): print("[sidebar.info]", *a)
+    class _ColumnConfigShim:
+        class CheckboxColumn:  # noqa: D401
+            def __init__(self, *a, **k): pass
+        class LinkColumn:
+            def __init__(self, *a, **k): pass
+        class TextColumn:
+            def __init__(self, *a, **k): pass
+    class _StreamlitShim:
+        def __init__(self):
+            self.session_state = {}
+            self.sidebar = _SidebarShim()
+            self.column_config = _ColumnConfigShim()
+        # layout
+        def set_page_config(self, *a, **k): pass
+        def title(self, *a, **k): print("[title]", *a)
+        def subheader(self, *a, **k): print("[subheader]", *a)
+        def divider(self): print("[divider]")
+        def caption(self, *a, **k): print("[caption]", *a)
+        def write(self, *a, **k): print("[write]", *a)
+        def markdown(self, *a, **k): print("[markdown]")
+        def info(self, *a, **k): print("[info]", *a)
+        def success(self, *a, **k): print("[success]", *a)
+        def error(self, *a, **k): print("[error]", *a)
+        def warning(self, *a, **k): print("[warning]", *a)
+        # containers/contexts
+        def expander(self, *a, **k): return _NoopContext()
+        def spinner(self, *a, **k): return _NoopContext()
+        def columns(self, spec):
+            n = spec if isinstance(spec, int) else (len(spec) if hasattr(spec, "__len__") else 2)
+            return [_NoopContext() for _ in range(n)]
+        # widgets (return safe defaults)
+        def text_area(self, *a, **k): return k.get("value", "")
+        def text_input(self, *a, **k): return k.get("value", "")
+        def selectbox(self, label, options, index=0, **k):
+            try: return options[index]
+            except Exception: return options[0] if options else ""
+        def checkbox(self, label, value=False, **k): return bool(value)
+        def slider(self, label, min_value=None, max_value=None, value=None, step=None, **k): return value
+        def button(self, *a, **k): return False
+        def file_uploader(self, *a, **k): return None
+        def data_editor(self, df, *a, **k): return df
+        def download_button(self, *a, **k): print("[download_button]")
+    def cache_data(*a, **k):
+        def _wrap(fn): return fn
+        return _wrap
+    st = _StreamlitShim()
+    st.cache_data = cache_data
+
+# =====================
+# Conditional PDF backends (avoid 'frontend' import error from PyMuPDF)
+# =====================
+HAVE_FITZ = False
+HAVE_PYPDF = False
+_PDF_BACKEND = "none"
+try:
+    import fitz  # PyMuPDF
+    HAVE_FITZ = True
+    _PDF_BACKEND = "PyMuPDF"
+except Exception:
+    try:
+        from pypdf import PdfReader as _PdfReader  # modern fork of PyPDF2
+        HAVE_PYPDF = True
+        _PDF_BACKEND = "pypdf"
+    except Exception:
+        try:
+            from PyPDF2 import PdfReader as _PdfReader
+            HAVE_PYPDF = True
+            _PDF_BACKEND = "PyPDF2"
+        except Exception:
+            _PDF_BACKEND = "none"
 
 # =====================
 # Config & constants
 # =====================
-APP_TITLE = "CRC Manuscript Builder (MVP v3.1)"
+APP_TITLE = "CRC Manuscript Builder (MVP v3.1.4)"
 EUTILS_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 CROSSREF_BASE = "https://api.crossref.org/works"
 OPENALEX_BASE = "https://api.openalex.org/sources"
@@ -67,17 +167,132 @@ def find_doi_in_text(txt: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
-def extract_pdf_text_and_doi(file_bytes: bytes) -> Tuple[str, Optional[str]]:
+# ---------- DOCX fallback helpers ----------
+_DOCX_NS = {
+    "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+    "cp": "http://schemas.openxmlformats.org/package/2006/metadata/core-properties",
+    "dc": "http://purl.org/dc/elements/1.1/",
+    "dcterms": "http://purl.org/dc/terms/",
+    "xsi": "http://www.w3.org/2001/XMLSchema-instance",
+}
+
+
+def read_docx_text_fallback(docx_bytes: bytes) -> str:
+    """Read .docx text without python-docx by parsing word/document.xml."""
     try:
-        with fitz.open(stream=file_bytes, filetype="pdf") as doc:
-            texts = []
-            for page in doc:
-                texts.append(page.get_text())
-            full = "\n".join(texts)
-            doi = find_doi_in_text(full)
-            return full, doi
+        with zipfile.ZipFile(io.BytesIO(docx_bytes)) as z:
+            xml = z.read("word/document.xml")
+        root = ET.fromstring(xml)
+        texts = []
+        for p in root.findall(".//w:p", _DOCX_NS):
+            frag = []
+            for t in p.findall(".//w:t", _DOCX_NS):
+                frag.append(t.text or "")
+            para = "".join(frag).strip()
+            if para:
+                texts.append(para)
+        return "\n".join(texts)
     except Exception:
-        return "", None
+        return ""
+
+
+def create_docx_from_markdown_fallback(md_text: str) -> bytes:
+    """Create a minimal .docx (paragraph per block) without python-docx."""
+    from xml.sax.saxutils import escape
+    # very simple block split
+    paragraphs = [p.strip() for p in md_text.split("\n\n")]
+    if not any(paragraphs):
+        paragraphs = [""]
+    # Minimal required parts
+    content_types = (
+        """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+  <Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
+  <Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>
+</Types>"""
+    ).strip()
+    rels = (
+        """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"""
+    ).strip()
+    # Build document.xml paragraphs
+    paras_xml = []
+    for p in paragraphs:
+        txt = escape(p)
+        paras_xml.append(f"<w:p><w:r><w:t xml:space=\"preserve\">{txt}</w:t></w:r></w:p>")
+    document_xml = (
+        """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    {PARAS}
+    <w:sectPr/>
+  </w:body>
+</w:document>""".replace("{PARAS}", "\n    ".join(paras_xml))
+    ).strip()
+    core = (
+        """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <dc:title>CRC Manuscript</dc:title>
+  <dc:creator>CRC Manuscript Builder</dc:creator>
+  <cp:lastModifiedBy>CRC Manuscript Builder</cp:lastModifiedBy>
+</cp:coreProperties>"""
+    ).strip()
+    app = (
+        """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">
+  <Application>CRC Manuscript Builder</Application>
+</Properties>"""
+    ).strip()
+    bio = io.BytesIO()
+    with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", content_types)
+        z.writestr("_rels/.rels", rels)
+        z.writestr("word/document.xml", document_xml)
+        z.writestr("docProps/core.xml", core)
+        z.writestr("docProps/app.xml", app)
+    bio.seek(0)
+    return bio.read()
+
+
+# ---------- PDF extract ----------
+
+def extract_pdf_text_and_doi(file_bytes: bytes) -> Tuple[str, Optional[str]]:
+    """Extract text & DOI from PDF bytes using available backend.
+    Returns (full_text, doi_or_None). Safe to call even if no backend.
+    """
+    # Backend 1: PyMuPDF
+    if HAVE_FITZ:
+        try:
+            import fitz  # re-import inside for safety
+            with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+                texts = [page.get_text() for page in doc]
+            full = "\n".join(texts)
+            return full, find_doi_in_text(full)
+        except Exception:
+            pass  # fallthrough
+    # Backend 2: pypdf / PyPDF2
+    if HAVE_PYPDF:
+        try:
+            from io import BytesIO
+            bio = BytesIO(file_bytes)
+            reader = _PdfReader(bio)  # type: ignore[name-defined]
+            texts = []
+            for page in getattr(reader, "pages", []):
+                try:
+                    texts.append(page.extract_text() or "")
+                except Exception:
+                    texts.append("")
+            full = "\n".join(texts)
+            return full, find_doi_in_text(full)
+        except Exception:
+            pass
+    # No backend
+    return "", None
 
 
 # =====================
@@ -238,8 +453,8 @@ def pubmed_parse_records(root: etree._Element) -> List[RefMeta]:
                 doi = idn.text.lower()
         url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else None
         abst, concl = _extract_abstract_and_conclusion(art)
-        out.append(RefMeta(doi=doi, title=title, journal=journal, year=year, authors=authors, pmid=pmid, url=url,
-                           abstract_text=abst, abstract_conclusion=concl))
+        out.append(RefMeta(doi=doi, title=title, journal=journal, year=year, authors=authors,
+                           pmid=pmid, url=url, abstract_text=abst, abstract_conclusion=concl))
     return out
 
 
@@ -251,7 +466,6 @@ def crossref_get(doi: str) -> Optional[RefMeta]:
         j = r.json().get("message", {})
         title = "; ".join(j.get("title", [])) or None
         journal = (j.get("container-title") or [None])[0]
-        # Year extraction covers both key variants
         year = None
         if j.get("issued", {}).get("'date-parts'"):
             year = str(j["issued"]["'date-parts'"][0][0])
@@ -324,18 +538,19 @@ def to_ris(refs: List[RefMeta]) -> str:
 
 
 # =====================
-# UI
+# UI (works in Streamlit; no-op in headless shim)
 # =====================
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 
 with st.expander("사용 지침(필독)", expanded=True):
     st.markdown(
-        """
+        f"""
         - **허구 금지**: 인용은 선택/업로드한 문헌으로만 제한됩니다.
         - **IF 정렬**: `journal_if.csv` 제공 시 IF 기준 정렬, 없으면 OpenAlex 지표(선택) 사용 가능.
         - **RIS 내보내기**: 검색 선택/허용 문헌(전체·선택)을 EndNote용 `.ris`로 다운로드할 수 있습니다.
         - **PDF 업로드**: 최대 50개, PDF 내 DOI 자동 추출 시도.
+        - **백엔드**: PDF → **{_PDF_BACKEND}**, DOCX → **{'python-docx' if _HAVE_PYDOCX else 'fallback-zip'}**, 모드 → **{'Streamlit UI' if _HAVE_STREAMLIT else 'Headless(Shim)'}**
         """
     )
 
@@ -347,11 +562,18 @@ with colA:
     up_docx = st.file_uploader("연구계획서 요약 .docx 업로드 (선택)", type=["docx"], accept_multiple_files=False)
     if up_docx is not None:
         try:
-            bio = io.BytesIO(up_docx.read())
-            doc = Document(bio)
-            text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
-            st.session_state["protocol_ta"] = text
-            st.success("워드 파일에서 연구계획서 요약을 불러왔어요.")
+            data = up_docx.read()
+            if _HAVE_PYDOCX and Document:
+                bio = io.BytesIO(data)
+                doc = Document(bio)
+                text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+            else:
+                text = read_docx_text_fallback(data)
+            if text:
+                st.session_state["protocol_ta"] = text
+                st.success("워드 파일에서 연구계획서 요약을 불러왔어요.")
+            else:
+                st.warning("워드 파일에서 텍스트를 추출할 수 없습니다.")
         except Exception as e:
             st.error(f"워드 파일을 읽는 중 오류: {e}")
     results_txt = st.text_area("핵심 결과 요약 (Key Results)", height=100)
@@ -377,15 +599,15 @@ retmax = st.slider("검색 개수", 10, MAX_RESULTS, 50, step=5)
 run_search = st.button("PubMed 검색 실행")
 
 if "search_results" not in st.session_state:
-    st.session_state.search_results: List[RefMeta] = []
+    st.session_state["search_results"] = []
 if "search_df" not in st.session_state:
-    st.session_state.search_df = None
+    st.session_state["search_df"] = None
 
 if run_search and search_query:
     with st.spinner("PubMed 검색 중…"):
         pmids = pubmed_search(search_query, retmax=retmax)
         root = pubmed_fetch_xml(pmids)
-        st.session_state.search_results = pubmed_parse_records(root)
+        st.session_state["search_results"] = pubmed_parse_records(root)
 
 # 2-1) IF 붙이고 정렬 (IF desc → journal asc → year desc)
 @st.cache_data(show_spinner=False)
@@ -405,7 +627,7 @@ def load_journal_if_csv() -> Optional[pd.DataFrame]:
 
 jif = load_journal_if_csv()
 
-if st.session_state.search_results:
+if st.session_state.get("search_results"):
     sdf = pd.DataFrame([
         {
             "select": False,
@@ -418,7 +640,7 @@ if st.session_state.search_results:
             "Conclusion": r.abstract_conclusion,
             "url": r.url,
         }
-        for r in st.session_state.search_results
+        for r in st.session_state["search_results"]
     ])
     sdf["IF"] = None
     if jif is not None:
@@ -454,7 +676,7 @@ if st.session_state.search_results:
         },
         key="search_editor",
     )
-    st.session_state.search_df = edited
+    st.session_state["search_df"] = edited
 
     c1, c2, c3 = st.columns([1,1,2])
     with c1:
@@ -492,6 +714,8 @@ st.divider()
 st.subheader("3) PDF 업로드(최대 50) → 허용 문헌")
 pdfs = st.file_uploader("논문 PDF 업로드", type=["pdf"], accept_multiple_files=True)
 if st.button("PDF에서 DOI 추출 후 추가") and pdfs:
+    if _PDF_BACKEND == "none":
+        st.warning("PDF 파서가 설치되어 있지 않아 DOI를 추출할 수 없습니다. 'pymupdf' 또는 'pypdf'를 설치해 주세요.")
     added = 0
     st.session_state.setdefault("allowed", {})
     for up in pdfs[:MAX_UPLOADS]:
@@ -507,22 +731,31 @@ if st.button("PDF에서 DOI 추출 후 추가") and pdfs:
 st.subheader("4) 허용 문헌 (인용 가능한 집합)")
 st.session_state.setdefault("allowed", {})
 
-if st.session_state.allowed:
-    adf = pd.DataFrame([
-        {
+if st.session_state.get("allowed"):
+    adf_rows = []
+    for k, v in st.session_state["allowed"].items():
+        # 방어적 접근(혹시 dict 등이 섞여 들어온 경우 대비)
+        doi = getattr(v, "doi", None)
+        pmid = getattr(v, "pmid", None)
+        title = getattr(v, "title", None)
+        journal = getattr(v, "journal", None)
+        year = getattr(v, "year", None)
+        abstract_text = getattr(v, "abstract_text", None)
+        conclusion_text = getattr(v, "abstract_conclusion", None)
+        preview = (abstract_text[:300] + "…") if abstract_text and len(abstract_text) > 300 else (abstract_text or None)
+        adf_rows.append({
             "select": False,
             "key": k,
-            "doi": v.doi,
-            "pmid": v.pmid,
-            "title": v.title,
-            "journal": v.journal,
-            "year": v.year,
-            "Abstract": (v.abstract_text[:300] + "…") if v.abstract_text and len(v.abstract_text) > 300 else (v.abstract_text or None),
-            "Conclusion": v.abstract_conclusion,
-            "OA_link": unpaywall_best_oa_link(v.doi) if v.doi else None,
-        }
-        for k, v in st.session_state.allowed.items()
-    ])
+            "doi": doi,
+            "pmid": pmid,
+            "title": title,
+            "journal": journal,
+            "year": year,
+            "Abstract": preview,
+            "Conclusion": conclusion_text,
+            "OA_link": unpaywall_best_oa_link(doi) if doi else None,
+        })
+    adf = pd.DataFrame(adf_rows)
 
     edited_allowed = st.data_editor(
         adf,
@@ -548,13 +781,13 @@ if st.session_state.allowed:
     if del_btn:
         to_del = edited_allowed[edited_allowed["select"] == True]["key"].tolist()
         for k in to_del:
-            st.session_state.allowed.pop(k, None)
+            st.session_state["allowed"].pop(k, None)
         st.success(f"삭제 완료: {len(to_del)}편")
 
     if ris_allowed_sel or ris_allowed_all:
         export_keys = (edited_allowed[edited_allowed["select"] == True]["key"].tolist() if ris_allowed_sel
-                       else list(st.session_state.allowed.keys()))
-        refs = [st.session_state.allowed[k] for k in export_keys if k in st.session_state.allowed]
+                       else list(st.session_state["allowed"].keys()))
+        refs = [st.session_state["allowed"][k] for k in export_keys if k in st.session_state["allowed"]]
         ris_txt = to_ris(refs)
         fname = "allowed_selection.ris" if ris_allowed_sel else "allowed_all.ris"
         st.download_button(".ris 다운로드", data=ris_txt.encode("utf-8"), file_name=fname, mime="application/x-research-info-systems")
@@ -632,22 +865,22 @@ style_note = (custom_style if style_option == "없음/기타(직접입력)" else
 SECTIONS = ["Cover Letter", "Title Page", "Abstract", "Introduction", "Methods", "Results", "Discussion"]
 
 if "sections" not in st.session_state:
-    st.session_state.sections: Dict[str, str] = {}
+    st.session_state["sections"] = {}
 
 cols = st.columns(2)
 for i, sec in enumerate(SECTIONS):
     with cols[i % 2]:
         st.markdown(f"**{sec}**")
         if st.button(f"{sec} 생성", key=f"gen_{sec}"):
-            txt = llm.generate_section(sec, topic, st.session_state.get("protocol_ta", ""), results_txt, st.session_state.allowed, style_note)
-            st.session_state.sections[sec] = txt
-        st.text_area(f"{sec} 미리보기", value=st.session_state.sections.get(sec, ""), height=200, key=f"ta_{sec}")
+            txt = llm.generate_section(sec, topic, st.session_state.get("protocol_ta", ""), results_txt, st.session_state.get("allowed", {}), style_note)
+            st.session_state["sections"][sec] = txt
+        st.text_area(f"{sec} 미리보기", value=st.session_state["sections"].get(sec, ""), height=200, key=f"ta_{sec}")
 
 st.markdown("**References** 섹션은 최종 병합 단계에서 자동 생성됩니다.")
 
 if st.button("최종 병합 및 번호 재정렬"):
     rm = ReferenceManager()
-    for k, m in st.session_state.allowed.items():
+    for k, m in st.session_state.get("allowed", {}).items():
         if k.startswith("pmid:") and m:
             m.pmid = k.split(":",1)[1]
         elif m:
@@ -658,7 +891,7 @@ if st.button("최종 병합 및 번호 재정렬"):
         seq = []
         def _rep(m):
             tag = m.group(1).strip().lower()
-            if tag not in st.session_state.allowed:
+            if tag not in st.session_state.get("allowed", {}):
                 return f"[CITE-INVALID:{tag}]"
             seq.append(tag)
             n = rm.cite(tag)
@@ -669,7 +902,7 @@ if st.button("최종 병합 및 번호 재정렬"):
     merged_parts = []
     citation_seq = []
     for sec in SECTIONS:
-        txt = st.session_state.sections.get(sec, "")
+        txt = st.session_state["sections"].get(sec, "")
         if not txt:
             continue
         rep, seq = replace_citations(txt)
@@ -682,29 +915,80 @@ if st.button("최종 병합 및 번호 재정렬"):
     final_md = "\n\n".join(merged_parts) + "\n\n## References\n\n" + "\n".join(
         [f"[{i+1}] {line}" for i, line in enumerate(refs)]
     )
-    st.session_state.final_md = final_md
+    st.session_state["final_md"] = final_md
     st.success("병합 완료 – 아래에서 미리보기/내보내기 하세요.")
 
 # 미리보기 및 내보내기
 if "final_md" in st.session_state:
     st.subheader("미리보기 (Markdown)")
-    st.text_area("Final Markdown", value=st.session_state.final_md, height=420)
+    st.text_area("Final Markdown", value=st.session_state["final_md"], height=420)
 
-    def md_to_docx(md_text: str) -> bytes:
-        doc = Document()
-        style = doc.styles["Normal"]
-        style.font.name = "Calibri"
-        style.font.size = Pt(11)
-        for block in md_text.split("\n\n"):
-            doc.add_paragraph(block)
-        bio = io.BytesIO()
-        doc.save(bio)
-        bio.seek(0)
-        return bio.read()
+    def md_to_docx_bytes(md_text: str) -> bytes:
+        if _HAVE_PYDOCX and Document and Pt:
+            # python-docx path
+            bio = io.BytesIO()
+            try:
+                doc = Document()
+                style = doc.styles["Normal"]
+                style.font.name = "Calibri"
+                style.font.size = Pt(11)
+                for block in md_text.split("\n\n"):
+                    doc.add_paragraph(block)
+                doc.save(bio)
+                bio.seek(0)
+                return bio.read()
+            except Exception:
+                # fallback if something goes wrong even with python-docx
+                return create_docx_from_markdown_fallback(md_text)
+        else:
+            # fallback builder
+            return create_docx_from_markdown_fallback(md_text)
 
-    st.download_button("Download .md", data=st.session_state.final_md.encode("utf-8"), file_name="manuscript.md", mime="text/markdown")
-    st.download_button("Download .docx", data=md_to_docx(st.session_state.final_md), file_name="manuscript.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    st.download_button("Download .md", data=st.session_state["final_md"].encode("utf-8"), file_name="manuscript.md", mime="text/markdown")
+    st.download_button("Download .docx", data=md_to_docx_bytes(st.session_state["final_md"]), file_name="manuscript.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
 st.divider()
 
-st.caption("© 2025 CRC Manuscript Builder (MVP v3.1). Evidence-locked generation. No PHI.")
+st.caption("© 2025 CRC Manuscript Builder (MVP v3.1.4). Evidence-locked generation. No PHI.")
+
+# =====================
+# (Optional) Lightweight sanity tests (run only if explicitly requested)
+# =====================
+
+def _run_sanity_tests():
+    """Minimal non-network tests to catch regressions in critical blocks."""
+    # 1) Test RIS exporter with minimal RefMeta (existing)
+    r = RefMeta(doi="10.1000/test.doi", title="T", journal="J", year="2024", authors=["A B"], pmid="1", url="U", abstract_text="abs")
+    ris = to_ris([r])
+    assert "TY  - JOUR" in ris and "DO  - 10.1000/test.doi" in ris
+    # 2) Test reference manager numbering (existing)
+    rm = ReferenceManager(); rm.register(r); n = rm.cite(r.doi)
+    assert n == 1
+    # 3) Test citation replacement helper (existing)
+    txt = "See [CITE:10.1000/test.doi]."
+    rm2 = ReferenceManager(); rm2.register(r)
+    def _rep(m):
+        tag = m.group(1).strip().lower(); rm2.cite(tag); return "[1]"
+    out = re.sub(r"\[CITE:([^\]]+)\]", _rep, txt)
+    assert out == "See [1]."
+    # 4) New: DOI regex basic
+    assert find_doi_in_text("doi:10.5555/abc.DEF-123") == "10.5555/abc.DEF-123"
+    # 5) New: whitespace normalization
+    assert norm_text("  a\t b\n c  ") == "a b c"
+    # 6) New: PDF extractor with invalid bytes should not crash and return (text, None)
+    text, doi = extract_pdf_text_and_doi(b"not-a-real-pdf")
+    assert isinstance(text, str) and (doi is None or isinstance(doi, str))
+    # 7) New: DOCX fallback roundtrip (build then read)
+    sample = "Hello world\n\nSecond paragraph"
+    built = create_docx_from_markdown_fallback(sample)
+    parsed = read_docx_text_fallback(built)
+    assert "Hello world" in parsed and "Second paragraph" in parsed
+    return "OK"
+
+# To run: set environment variable RUN_APP_TESTS=1 before launching Streamlit
+if os.getenv("RUN_APP_TESTS") == "1":
+    try:
+        res = _run_sanity_tests()
+        st.sidebar.success(f"Sanity tests: {res}")
+    except Exception as e:
+        st.sidebar.error(f"Sanity tests failed: {e}")
